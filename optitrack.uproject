@@ -1,0 +1,28 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.0",
+	"Category": "",
+	"Description": "",
+	"Plugins": [
+		{
+			"Name": "ICVFX",
+			"Enabled": true
+		},
+		{
+			"Name": "LedWallCalibration",
+			"Enabled": true
+		},
+		{
+			"Name": "OptitrackLiveLink",
+			"Enabled": true
+		},
+		{
+			"Name": "OptitrackNatnet",
+			"Enabled": true
+		}
+	],
+	"TargetPlatforms": [
+		"WindowsNoEditor",
+		"Windows"
+	]
+}
