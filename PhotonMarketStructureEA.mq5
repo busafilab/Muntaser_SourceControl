@@ -27,7 +27,6 @@
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
 #include <Trade/SymbolInfo.mqh>
-#include <Trade/DealInfo.mqh>
 
 //============================== INPUTS ===========================
 input group "=== Kill switch ==="
@@ -153,7 +152,6 @@ struct JournalRow
 CTrade        gTrade;
 CPositionInfo gPos;
 CSymbolInfo   gSym;
-CDealInfo     gDeal;
 
 #define SWING_CAP   512
 #define ZONE_CAP    128
@@ -916,17 +914,18 @@ void ManageOpenPositions()
       if(gPos.Magic() != MagicNumber || gPos.Symbol() != _Symbol) continue;
 
       ulong ticket = gPos.Ticket();
-      OpenContext *ctx = FindContext(ticket);
-      if(ctx == NULL) continue;
+      int   ci     = FindContextIdx(ticket);
+      if(ci < 0) continue;
 
-      double cur     = ctx.bullish ? gSym.Bid() : gSym.Ask();
       if(!gSym.RefreshRates()) continue;
-      cur            = ctx.bullish ? gSym.Bid() : gSym.Ask();
-      double moved   = ctx.bullish ? (cur - ctx.entry) : (ctx.entry - cur);
-      double rNow    = (ctx.riskDist > 0) ? moved / ctx.riskDist : 0.0;
+      double cur   = g_openCtx[ci].bullish ? gSym.Bid() : gSym.Ask();
+      double moved = g_openCtx[ci].bullish
+                     ? (cur - g_openCtx[ci].entry)
+                     : (g_openCtx[ci].entry - cur);
+      double rNow  = (g_openCtx[ci].riskDist > 0) ? moved / g_openCtx[ci].riskDist : 0.0;
 
       // partial at 1R
-      if(PartialAtR && !ctx.partialDone && rNow >= 1.0)
+      if(PartialAtR && !g_openCtx[ci].partialDone && rNow >= 1.0)
       {
          double curVol = gPos.Volume();
          double minVol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
@@ -936,31 +935,32 @@ void ManageOpenPositions()
          if(partV >= minVol && (curVol - partV) >= minVol)
          {
             if(gTrade.PositionClosePartial(ticket, partV))
-               ctx.partialDone = true;
+               g_openCtx[ci].partialDone = true;
          }
       }
 
       // break-even
-      if(UseBreakEven && !ctx.atBE && rNow >= BERTriggerR)
+      if(UseBreakEven && !g_openCtx[ci].atBE && rNow >= BERTriggerR)
       {
-         double newSL = ctx.bullish
-                        ? ctx.entry + BELockPoints * _Point
-                        : ctx.entry - BELockPoints * _Point;
-         if((ctx.bullish && newSL > gPos.StopLoss())
-            || (!ctx.bullish && (gPos.StopLoss() == 0 || newSL < gPos.StopLoss())))
+         double newSL = g_openCtx[ci].bullish
+                        ? g_openCtx[ci].entry + BELockPoints * _Point
+                        : g_openCtx[ci].entry - BELockPoints * _Point;
+         if((g_openCtx[ci].bullish && newSL > gPos.StopLoss())
+            || (!g_openCtx[ci].bullish
+                && (gPos.StopLoss() == 0 || newSL < gPos.StopLoss())))
          {
             if(gTrade.PositionModify(ticket, newSL, gPos.TakeProfit()))
-               ctx.atBE = true;
+               g_openCtx[ci].atBE = true;
          }
       }
 
       // ATR trail (only after BE)
-      if(UseATRTrail && ctx.atBE && atr > 0)
+      if(UseATRTrail && g_openCtx[ci].atBE && atr > 0)
       {
-         double trail = ctx.bullish
+         double trail = g_openCtx[ci].bullish
                         ? cur - atr * ATRTrailMultiplier
                         : cur + atr * ATRTrailMultiplier;
-         if(ctx.bullish)
+         if(g_openCtx[ci].bullish)
          {
             if(trail > gPos.StopLoss() && trail < cur)
                gTrade.PositionModify(ticket, trail, gPos.TakeProfit());
@@ -1001,24 +1001,19 @@ void RegisterOpenContext(ulong ticket, bool buy, double entry, double sl,
    g_openCtxN++;
 }
 
-OpenContext* FindContext(ulong ticket)
+// Returns array index, or -1 if not found.
+int FindContextIdx(ulong ticket)
 {
    for(int i = 0; i < g_openCtxN; i++)
-      if(g_openCtx[i].ticket == ticket) return GetPointer(g_openCtx[i]);
-   return NULL;
+      if(g_openCtx[i].ticket == ticket) return i;
+   return -1;
 }
 
-void RemoveContext(ulong ticket)
+void RemoveContextAt(int idx)
 {
-   for(int i = 0; i < g_openCtxN; i++)
-   {
-      if(g_openCtx[i].ticket == ticket)
-      {
-         for(int j = i; j < g_openCtxN - 1; j++) g_openCtx[j] = g_openCtx[j + 1];
-         g_openCtxN--;
-         return;
-      }
-   }
+   if(idx < 0 || idx >= g_openCtxN) return;
+   for(int j = idx; j < g_openCtxN - 1; j++) g_openCtx[j] = g_openCtx[j + 1];
+   g_openCtxN--;
 }
 
 //============================== TRADE EVENTS =====================
@@ -1027,8 +1022,6 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeResult      &res)
 {
    if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
-   if(!gDeal.SelectByIndex(0)) {}        // no-op (CDealInfo uses ticket)
-   if(!gDeal.Ticket()) {}
 
    ulong dealTicket = trans.deal;
    if(!HistoryDealSelect(dealTicket)) return;
@@ -1041,18 +1034,22 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    if(entryFlag != DEAL_ENTRY_OUT && entryFlag != DEAL_ENTRY_OUT_BY) return;
 
    ulong posId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
-   OpenContext *ctx = FindContext(posId);
+   int   ci    = FindContextIdx(posId);
    // also try matching by ticket (in case we stored order ticket)
-   if(ctx == NULL) ctx = FindContext(dealTicket);
-   if(ctx == NULL) return;
+   if(ci < 0) ci = FindContextIdx(dealTicket);
+   if(ci < 0) return;
 
    double closePx = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
-   double moved   = ctx.bullish ? (closePx - ctx.entry) : (ctx.entry - closePx);
-   double r       = (ctx.riskDist > 0) ? moved / ctx.riskDist : 0.0;
+   double moved   = g_openCtx[ci].bullish
+                    ? (closePx - g_openCtx[ci].entry)
+                    : (g_openCtx[ci].entry - closePx);
+   double r       = (g_openCtx[ci].riskDist > 0)
+                    ? moved / g_openCtx[ci].riskDist : 0.0;
 
-   AddJournal(ctx.bullish, ctx.htfAgree, ctx.hadFVG, ctx.hadSweep,
-              ctx.session, r, r > 0.0);
-   RemoveContext(posId);
+   AddJournal(g_openCtx[ci].bullish, g_openCtx[ci].htfAgree,
+              g_openCtx[ci].hadFVG,  g_openCtx[ci].hadSweep,
+              g_openCtx[ci].session, r, r > 0.0);
+   RemoveContextAt(ci);
 }
 
 //============================== SELF-LEARNING ====================
